@@ -13,6 +13,7 @@
 #endif
 
 #include "main.h"
+#include "priv.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -32,8 +33,8 @@
 
 static void print_usage(const char *prog);
 static int  parse_args(netmand_ctx_t *ctx, int argc, char **argv);
-static int  write_pid_file(const netmand_ctx_t *ctx);
-static void remove_pid_file(const netmand_ctx_t *ctx);
+static int  write_pid_file(netmand_ctx_t *ctx);
+static void remove_pid_file(netmand_ctx_t *ctx);
 static int  setup_signals(netmand_ctx_t *ctx);
 static void handle_signal(netmand_ctx_t *ctx, int fd, uint32_t events);
 static int  daemonize(void);
@@ -42,15 +43,16 @@ static int  daemonize(void);
  * Event loop implementation
  * ================================================================= */
 
-int event_loop_add(netmand_ctx_t *ctx, int fd, uint32_t events,
-                   epoll_handler_t *handler)
+int event_loop_add(netmand_ctx_t *ctx, epoll_handler_t *handler,
+                   uint32_t events)
 {
     struct epoll_event ev = {
         .events = events,
         .data.ptr = handler,
     };
-    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-        fprintf(stderr, "epoll_ctl ADD fd=%d: %s\n", fd, strerror(errno));
+    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, handler->fd, &ev) < 0) {
+        fprintf(stderr, "epoll_ctl ADD fd=%d: %s\n", handler->fd,
+                strerror(errno));
         return -1;
     }
     return 0;
@@ -104,8 +106,6 @@ void event_loop_run(netmand_ctx_t *ctx)
  * Signal handling via signalfd
  * ================================================================= */
 
-static epoll_handler_t signal_handler_entry;
-
 static int setup_signals(netmand_ctx_t *ctx)
 {
     sigset_t mask;
@@ -131,11 +131,12 @@ static int setup_signals(netmand_ctx_t *ctx)
     }
 
     /* Register the signalfd with the epoll loop. */
-    signal_handler_entry.fd = ctx->signal_fd;
-    signal_handler_entry.callback = handle_signal;
+    ctx->signal_handler.fd       = ctx->signal_fd;
+    ctx->signal_handler.callback = handle_signal;
 
-    if (event_loop_add(ctx, ctx->signal_fd, EPOLLIN, &signal_handler_entry) < 0) {
+    if (event_loop_add(ctx, &ctx->signal_handler, EPOLLIN) < 0) {
         close(ctx->signal_fd);
+        ctx->signal_fd = -1;
         return -1;
     }
 
@@ -178,7 +179,7 @@ static void handle_signal(netmand_ctx_t *ctx, int fd, uint32_t events)
  * PID file management
  * ================================================================= */
 
-static int write_pid_file(const netmand_ctx_t *ctx)
+static int write_pid_file(netmand_ctx_t *ctx)
 {
     /* Check for a stale PID file. */
     FILE *f = fopen(ctx->pid_path, "r");
@@ -208,12 +209,25 @@ static int write_pid_file(const netmand_ctx_t *ctx)
     fprintf(f, "%d\n", getpid());
     fclose(f);
 
+    /* From here on the file is ours, and only we may unlink it. */
+    ctx->pid_file_owned = true;
+
     return 0;
 }
 
-static void remove_pid_file(const netmand_ctx_t *ctx)
+static void remove_pid_file(netmand_ctx_t *ctx)
 {
+    /*
+     * Never unlink a PID file we did not write: a second instance that
+     * exits because the first one is already running must leave the
+     * running daemon's PID file alone, or the init script can no longer
+     * stop it.
+     */
+    if (!ctx->pid_file_owned)
+        return;
+
     unlink(ctx->pid_path);
+    ctx->pid_file_owned = false;
 }
 
 /* ====================================================================
@@ -281,7 +295,7 @@ static int parse_args(netmand_ctx_t *ctx, int argc, char **argv)
     /* Defaults */
     ctx->conf_path  = NETMAND_DEFAULT_CONF;
     ctx->pid_path   = NETMAND_PID_FILE;
-    ctx->foreground = true;
+    ctx->foreground = false;
 
     while ((opt = getopt(argc, argv, "c:fp:vh")) != -1) {
         switch (opt) {
@@ -352,6 +366,15 @@ int main(int argc, char **argv)
 
     /* --- Write PID file --- */
     if (write_pid_file(&ctx) < 0) {
+        goto cleanup;
+    }
+
+    /*
+     * Drop to CAP_NET_ADMIN + CAP_NET_RAW (AD-8).  As privileged sockets
+     * are added (netlink in Step 5, AF_PACKET in Step 12) they are opened
+     * above this line; nothing below it needs full root.
+     */
+    if (privileges_drop() < 0) {
         goto cleanup;
     }
 

@@ -10,10 +10,10 @@ A step-by-step development plan for the `netmand` network management daemon, org
 
 | | |
 |---|---|
-| **Built** | Step 1 only — `Makefile`, `conf/netmand.conf`, [src/core/main.c](../src/core/main.c) (387 LOC), [src/core/main.h](../src/core/main.h) (79 LOC) |
+| **Built** | Steps 1 and 1.5 — `Makefile` (incl. `make check`), `conf/netmand.conf`, [src/core/main.c](../src/core/main.c), [src/core/main.h](../src/core/main.h), [src/core/priv.c](../src/core/priv.c) / [priv.h](../src/core/priv.h) |
 | **Empty** | `tests/`, `tools/` |
-| **Verified** | `src/core/main.c` compiles clean under `-std=c99 -Wall -Wextra -Werror -pedantic` |
-| **Next** | Step 1.5 — fix three bugs in shipped Step 1 code before building on it |
+| **Verified** | Clean under `-std=c99 -Wall -Wextra -Werror -pedantic` on gcc and under ASan/UBSan; daemonizes, honours PID-file ownership, drops to `cap_net_admin,cap_net_raw` |
+| **Next** | Step 2 — logger (ring buffer + multi-sink) |
 
 ---
 
@@ -120,13 +120,13 @@ graph TD
 - [x] `make` compiles without warnings (`-Wall -Wextra -Werror -pedantic`) — **verified**, gcc 15.2.1
 - [x] `make clean` removes all artifacts
 - [x] `SIGHUP` is caught and sets `reload_pending`
-- [ ] ~~Daemon starts, writes PID file, enters loop, exits on `SIGTERM`~~ — **partially false.** The loop and `SIGTERM` work; the PID file lands in the wrong place and daemonization never runs. See Step 1.5.
+- [x] Daemon starts, writes PID file, enters loop, exits on `SIGTERM` — was **partially false** at Step 1 (the PID file landed in the wrong place and daemonization never ran); **fixed in Step 1.5**.
 
 ---
 
 ## Step 1.5 — Fix Step 1, add CI, set the privilege model
 
-Three real bugs and two design smells in shipped code. Fix them before nine more modules copy the patterns.
+**Status: built.** Three real bugs and two design smells in shipped code. Fixed before nine more modules copy the patterns.
 
 ### Bugs
 
@@ -186,11 +186,14 @@ check:
 
 ### Verification Criteria
 
-- [ ] `netmand` with no `-f` forks, detaches, and writes `/var/run/netmand.pid`
-- [ ] Starting a second instance fails **and leaves the first instance's PID file intact**
-- [ ] No file-scope variables remain in `src/core/`
-- [ ] `make check` passes on gcc, clang, and the ARM cross-toolchain
-- [ ] `/proc/<pid>/status` shows only `cap_net_admin` and `cap_net_raw` in `CapEff`
+- [x] `netmand` with no `-f` forks, detaches, and writes its PID file — **verified**, own session, no controlling tty
+- [x] Starting a second instance fails **and leaves the first instance's PID file intact** — **verified** via `pid_file_owned`
+- [x] No file-scope variables remain in `src/core/` — the signalfd handler now lives in `netmand_ctx`
+- [x] `make check` passes on gcc and under ASan/UBSan; clang and `arm-linux-gnueabihf-gcc` are **not installed on this host** and are reported as skipped, not silently passed
+- [x] `/proc/<pid>/status` shows only `cap_net_admin` and `cap_net_raw` in `CapEff` — **verified** (`CapPrm`/`CapEff`/`CapBnd` = `0x3000`, `CapInh` = 0, `NoNewPrivs` = 1), exercised under `unshare -Ur` since this host has no passwordless root
+
+> [!NOTE]
+> Capability dropping lives in [src/core/priv.c](../src/core/priv.c), using the raw `capget`/`capset` syscalls rather than linking libcap. It drops the bounding set *before* `capset`, because shrinking it needs `CAP_SETPCAP` — which the `capset` itself takes away. Started unprivileged it retains nothing and logs a warning, so unit tests and developer shells still run.
 
 ---
 

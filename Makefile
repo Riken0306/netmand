@@ -8,6 +8,7 @@
 #   make            — build everything (daemon + tools)
 #   make netmand    — build just the daemon
 #   make tests      — build and run unit tests
+#   make check      — CI: gcc, clang, ASan/UBSan, cross-build
 #   make clean      — remove all build artifacts
 #
 # Cross-compile example:
@@ -16,9 +17,13 @@
 
 # --- Toolchain ---------------------------------------------------------------
 CC       ?= gcc
-CFLAGS   ?= -std=c99 -Wall -Wextra -Werror -pedantic
-CFLAGS   += -D_GNU_SOURCE
-LDFLAGS  ?=
+
+# ':=' not '?=': an inherited CFLAGS from the environment must not be able to
+# replace this line and take -Werror with it.  Callers add flags through
+# EXTRA_CFLAGS / EXTRA_LDFLAGS instead.
+CFLAGS   := -std=c99 -Wall -Wextra -Werror -pedantic -D_GNU_SOURCE
+CFLAGS   += $(EXTRA_CFLAGS)
+LDFLAGS  += $(EXTRA_LDFLAGS)
 LDLIBS   ?= -lpthread
 
 # --- Directories -------------------------------------------------------------
@@ -30,7 +35,8 @@ TOOLDIR   = tools
 TESTDIR   = tests
 
 # --- Source files (Step 1: core only) ----------------------------------------
-CORE_SRCS = $(SRCDIR)/core/main.c
+CORE_SRCS = $(SRCDIR)/core/main.c \
+            $(SRCDIR)/core/priv.c
 
 # Collect all source files — add more as modules are implemented.
 SRCS      = $(CORE_SRCS)
@@ -75,6 +81,34 @@ $(OBJDIR):
 .PHONY: tests
 tests:
 	@echo "==> No tests defined yet (coming in Step 2: Logger)"
+
+# =============================================================================
+# CI — build under every toolchain we ship on.  Cross-compile breakage found
+# at Step 16 is expensive; found here it is a one-line fix.
+# A toolchain that is not installed is reported and skipped, never silently
+# passed over.
+# =============================================================================
+CROSS_CC  ?= arm-linux-gnueabihf-gcc
+CHECK_CCS ?= gcc clang $(CROSS_CC)
+
+.PHONY: check
+check:
+	@rc=0; \
+	for cc in $(CHECK_CCS); do \
+	    if command -v $$cc >/dev/null 2>&1; then \
+	        echo "==> check: building with $$cc"; \
+	        $(MAKE) --no-print-directory clean >/dev/null && \
+	        $(MAKE) --no-print-directory CC=$$cc || rc=1; \
+	    else \
+	        echo "==> check: SKIPPED, $$cc not installed"; \
+	    fi; \
+	done; \
+	echo "==> check: building with ASan + UBSan"; \
+	$(MAKE) --no-print-directory clean >/dev/null && \
+	$(MAKE) --no-print-directory EXTRA_CFLAGS="-fsanitize=address,undefined -g" all tests || rc=1; \
+	$(MAKE) --no-print-directory clean >/dev/null; \
+	if [ $$rc -eq 0 ]; then echo "==> check: OK"; else echo "==> check: FAILED"; fi; \
+	exit $$rc
 
 # =============================================================================
 # Install (optional, for Buildroot integration)

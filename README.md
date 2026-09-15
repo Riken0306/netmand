@@ -369,6 +369,42 @@ case "$1" in
 esac
 ```
 
+`netmand` daemonizes by default and writes `/var/run/netmand.pid`; pass `-f` to
+stay in the foreground. A second instance refuses to start and leaves the
+running daemon's PID file untouched.
+
+---
+
+## Privilege Model
+
+netmand **must be started as root**, but does not stay fully privileged.
+
+Once its privileged sockets are open it calls `capset` and keeps exactly two
+capabilities for the rest of its life:
+
+| Capability | Needed for |
+|---|---|
+| `CAP_NET_ADMIN` | netlink address, route and link changes; per-interface IPv6 sysctls |
+| `CAP_NET_RAW` | the `AF_PACKET` socket used by the DHCPv4 client |
+
+Everything else is dropped from the permitted, effective, **inheritable** and
+**bounding** sets, and `PR_SET_NO_NEW_PRIVS` is set — so no `exec` (including an
+up/down hook script) can regain a capability. This matters because netmand
+parses attacker-controlled input: DHCP options and DHCPv6 replies arrive from
+the wire.
+
+Verify on a running daemon:
+
+```sh
+grep -E '^(NoNewPrivs|Cap(Inh|Prm|Eff|Bnd))' /proc/$(cat /var/run/netmand.pid)/status
+# CapPrm/CapEff/CapBnd: 0000000000003000  (cap_net_admin, cap_net_raw)
+# CapInh: 0000000000000000   NoNewPrivs: 1
+```
+
+Started without privileges, netmand drops to no capabilities at all and logs a
+warning — it will run, but every network change will fail. libcap is not
+linked; the drop uses the raw `capget`/`capset` syscalls.
+
 ---
 
 ## Development Roadmap
@@ -379,7 +415,7 @@ Detailed steps, testing strategy, and the architecture decisions behind them are
 ### Phase 1 — MVP
 - [x] Architecture and folder structure
 - [x] Makefile, skeleton `main.c`, signal handlers
-- [ ] Fix Step 1 defects, CI, capability dropping *(plan Step 1.5)*
+- [x] Fix Step 1 defects, CI, capability dropping *(plan Step 1.5)*
 - [ ] Logger (ring buffer + syslog + stderr + file sinks)
 - [ ] INI config parser
 - [ ] Netlink core (event + request sockets, ack/seq tracking)

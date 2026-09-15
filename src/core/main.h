@@ -18,7 +18,7 @@
 
 #define NETMAND_VERSION        "0.1.0"
 #define NETMAND_DEFAULT_CONF   "/etc/netmand/netmand.conf"
-#define NETMAND_PID_FILE       "netmand.pid"
+#define NETMAND_PID_FILE       "/var/run/netmand.pid"
 #define NETMAND_MAX_EPOLL_EVS  64
 
 /* --------------------------------------------------------------------
@@ -51,6 +51,11 @@ typedef struct netmand_ctx {
 
     /* PID file */
     const char *pid_path;        /* PID file path                       */
+    bool        pid_file_owned;  /* true once *we* wrote the PID file    */
+
+    /* Handlers owned by core.  Modules keep their own handler structs in
+     * their own context; nothing in netmand lives at file scope. */
+    epoll_handler_t signal_handler;
 } netmand_ctx_t;
 
 /* --------------------------------------------------------------------
@@ -58,12 +63,12 @@ typedef struct netmand_ctx {
  * ----------------------------------------------------------------- */
 
 /*
- * Register an fd + handler with the epoll loop.
+ * Register a handler with the epoll loop; handler->fd is the fd to watch.
  * The handler struct must remain valid for the lifetime of the registration.
  * Returns 0 on success, -1 on error.
  */
-int  event_loop_add(netmand_ctx_t *ctx, int fd, uint32_t events,
-                    epoll_handler_t *handler);
+int  event_loop_add(netmand_ctx_t *ctx, epoll_handler_t *handler,
+                    uint32_t events);
 
 /*
  * Remove an fd from the epoll loop.
