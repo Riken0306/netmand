@@ -10,10 +10,10 @@ A step-by-step development plan for the `netmand` network management daemon, org
 
 | | |
 |---|---|
-| **Built** | Steps 1 and 1.5 — `Makefile` (incl. `make check`), `conf/netmand.conf`, [src/core/main.c](../src/core/main.c), [src/core/main.h](../src/core/main.h), [src/core/priv.c](../src/core/priv.c) / [priv.h](../src/core/priv.h) |
-| **Empty** | `tests/`, `tools/` |
-| **Verified** | Clean under `-std=c99 -Wall -Wextra -Werror -pedantic` on gcc and under ASan/UBSan; daemonizes, honours PID-file ownership, drops to `cap_net_admin,cap_net_raw` |
-| **Next** | Step 2 — logger (ring buffer + multi-sink) |
+| **Built** | Steps 1, 1.5 and 2 — `Makefile` (incl. `make check` and a real `make tests`), `conf/netmand.conf`, [src/core/main.c](../src/core/main.c) / [main.h](../src/core/main.h), [src/core/priv.c](../src/core/priv.c) / [priv.h](../src/core/priv.h), [src/logger/logger.c](../src/logger/logger.c) / [logger.h](../src/logger/logger.h), [tests/test_logger.c](../tests/test_logger.c) |
+| **Empty** | `tools/` |
+| **Verified** | Clean under `-std=c99 -Wall -Wextra -Werror -pedantic` on gcc and under ASan/UBSan; daemonizes, honours PID-file ownership, drops to `cap_net_admin,cap_net_raw`; 85 logger assertions pass under ASan/UBSan |
+| **Next** | Step 3 — INI config parser (which reconfigures the logger's level and sinks from `[daemon]`) |
 
 ---
 
@@ -199,13 +199,86 @@ check:
 
 ## Step 2 — Logger (Ring Buffer + Multi-Sink)
 
-### What to Build
+**Status: built.**
+
+### What was built
 
 | File | Purpose |
 |---|---|
-| `src/logger/logger.h` | `log_init()`, `log_write()`, `log_set_level()`, `log_add_sink()`, level enum, `LOG_*` macros |
-| `src/logger/logger.c` | Ring buffer + sink dispatch: syslog, stderr, file, callback |
-| `tests/test_logger.c` | Unit test |
+| [src/logger/logger.h](../src/logger/logger.h) | `log_init()`, `log_shutdown()`, `log_write()` / `log_vwrite()`, `log_set_level()` / `log_get_level()`, `log_add_sink()` / `log_remove_sink()` / `log_active_sinks()`, `log_ring_dump()` / `log_ring_head()`, `log_level_name()` / `log_level_from_name()`, level enum, `log_debug()` / `log_info()` / `log_warn()` / `log_error()` macros |
+| [src/logger/logger.c](../src/logger/logger.c) | Ring buffer + write-through sink dispatch: syslog, stderr, file (with rotation), callback |
+| [tests/test_logger.c](../tests/test_logger.c) | Unit test — 11 cases, 85 assertions, no framework |
+
+Decisions taken while building, that the rest of the tree now depends on:
+
+- **One `log_add_sink(uint32_t sink, const log_sink_cfg_t *cfg)`**, not four
+  `log_add_sink_*()` functions. `sink` is a single `LOG_SINK_*` bit and the
+  config struct carries only what that sink needs (path + `max_bytes`, ident,
+  callback + user pointer). `LOG_SINK_*` is a bitmask so Step 3's
+  `daemon_config.log_sinks` can be handed straight back.
+- **The logger is a singleton** — file-scope state in `logger.c`. This is the
+  one deliberate exception to main.h's "no global state" rule (and to 1.5.4):
+  the `LOG_*` macros take no context argument, and failure paths that run
+  before a `netmand_ctx_t` exists still have to log. The header says so
+  explicitly, with the reason, so the next module does not read it as licence.
+- **`main.c` gained a `-s` flag.** Until Step 3 parses `[daemon]`, stderr is
+  the only sink `main()` turns on, and `daemonize()` sends it to `/dev/null`
+  — so a detached daemon is mute. `-s` keeps stdout/stderr attached after
+  startup (stdin still goes to `/dev/null`, and the process still detaches
+  into its own session with no controlling terminal), so output keeps
+  reaching whatever launched it — the debug UART on a board. Deliberately a
+  flag and not a fifth "console" sink: the gap it covers closes at Step 3,
+  and a sink that opened `/dev/console` itself would be machinery outliving
+  its purpose.
+
+- **Found and fixed while testing that flag: a daemonized netmand reported
+  success no matter what.** `daemonize()`'s parent called
+  `_exit(EXIT_SUCCESS)` at the fork, long before the child reached
+  `write_pid_file()` or `privileges_drop()` — so a second instance refusing
+  to start, or a failed capability drop, still exited 0. The README's init
+  script could not tell a daemon that came up from one that died on the spot.
+  This is Step 1.5 territory (1.5.2 fixed *which* PID file gets unlinked; it
+  did not fix what the launcher is told), recorded here because it was found
+  and fixed here.
+
+  The parent now holds a `pipe2(O_CLOEXEC)` and blocks until the child sends
+  a one-byte verdict, then exits with it; EOF means the child died without
+  reporting and becomes `EXIT_FAILURE`. `daemon_ready()` sends it and is
+  idempotent, so the `cleanup:` path can call it with `EXIT_FAILURE`
+  unconditionally. Two consequences worth keeping:
+    - **stdio now stays attached until `daemon_ready()`**, so startup errors
+      are visible on the launching terminal whether or not `-s` was given.
+      `-s` only governs logging *after* startup.
+    - **`SIGPIPE` is ignored** from `main()` onward: the readiness pipe is
+      the daemon's first write to something that can vanish, and the IPC
+      socket (Step 9) will be the next.
+    - The parent's read is blocking, which is safe only because startup does
+      no blocking I/O. Anything added before `daemon_ready()` in a later step
+      must keep that true, or a failure there wedges the caller instead of
+      failing it.
+
+- **The emit macros are lowercase — `log_debug()`, `log_info()`,
+  `log_warn()`, `log_error()` — not the `LOG_*` this step's brief asked for.**
+  `<syslog.h>` already defines `LOG_DEBUG`, `LOG_INFO`, `LOG_WARNING` and
+  `LOG_ERR` as object-like macros. Spelling ours `LOG_DEBUG(...)` would be a
+  macro redefinition — fatal under `-Werror` — in any translation unit that
+  included both headers, which would have put `<syslog.h>` off-limits to the
+  whole daemon to buy nothing. Lowercase kills the entire collision class,
+  since syslog's names are uppercase and always will be; the two headers can
+  now be included together in either order, which `test_macros` pins down by
+  including both and asserting on `LOG_INFO` and `log_info()` side by side.
+  The remaining `LOG_*` names in `logger.h` (`LOG_LEVEL_*`, `LOG_SINK_*`,
+  `LOG_RING_SIZE`, `LOG_MSG_MAX`, `LOG_PATH_MAX`, `LOG_FILE_MAX_DEFAULT`,
+  `LOG_PRINTF_FMT`) were checked against every `LOG_*` macro `<syslog.h>`
+  defines; none clash, so those keep the uppercase spelling.
+- **Timestamps render dmesg-style** (`[  1337.319582]`), seconds since boot,
+  because they are `CLOCK_MONOTONIC` per AD-6. On a box with no RTC the wall
+  clock jumps by decades at first NTP sync, which would reorder the log file.
+- **`log_level_from_name()` lives in the logger**, not in the Step 3 parser,
+  because the enum does. Step 3 should call it rather than re-tabulating.
+- **`make tests`** builds one binary per `tests/test_*.c` against every object
+  but `main.o`, and fails the build on a non-zero exit. `make check` already
+  invoked it; it is no longer a stub.
 
 ### Design Notes
 
@@ -244,9 +317,9 @@ typedef struct {
 
 ### Verification Criteria
 
-- [ ] All test cases pass under ASan and UBSan
-- [ ] Valgrind reports zero leaks
-- [ ] `main.c` uses `LOG_*` throughout; no `fprintf` remains outside pre-logger-init failure paths
+- [x] All test cases pass under ASan and UBSan — **verified**, 85 assertions, 0 failures, via `make check`
+- [ ] Valgrind reports zero leaks — **not run: valgrind is not installed on this host.** ASan's LSan ran in its place (clean, including a full daemon start/SIGHUP/SIGTERM cycle). This is a gap, not a pass; re-run before Step 16.
+- [x] `main.c` uses the logger macros throughout; no `fprintf` remains outside pre-logger-init failure paths — **verified**. (The criterion said `LOG_*`; the macros ended up lowercase, for the `<syslog.h>` reason above.) The three survivors in `main.c` are `print_usage()` (usage text, not a log line), the `-v` version banner on stdout, and `fprintf(f, ...)` writing the PID file itself. [src/core/priv.c](../src/core/priv.c) was converted too — it runs after `log_init()`, so leaving it on `fprintf` would have split the daemon's output across two mechanisms.
 
 ---
 

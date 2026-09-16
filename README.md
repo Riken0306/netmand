@@ -126,14 +126,25 @@ This replaces the `pthread_rwlock_t` earlier drafts placed in the region. An rwl
 Suitable for tight-loop polling (VoIP link-state checks, watchdog threads). For event-driven use, the Unix socket is simpler.
 
 ### Logging
-A multi-sink ring buffer. Log entries are written to the ring first, then flushed to any combination of:
+Levelled logging with a retrospective ring buffer and write-through sinks. Each entry is recorded in the ring and then handed straight to any combination of:
 
 - **syslog** — standard embedded log aggregation
 - **stderr** — useful during development and init startup
-- **file** — persistent ring buffer at `/var/log/netmand.log`
-- **callback** — `void (*log_cb)(int level, const char *msg)` registered by the application for in-process log capture
+- **file** — appending log at `/var/log/netmand.log`, rotated to a single `.old` generation at a configurable size (1 MiB by default)
+- **callback** — `void (*log_cb)(void *user, int level, uint64_t timestamp_us, const char *msg)` registered by the application for in-process log capture
 
-Log level, ring buffer size, and active sinks are all configurable at runtime.
+The ring is *not* a queue and nothing drains it: sinks are written synchronously inside the log call, so the ring exists only so the last entries can be dumped on demand (`netmandctl log`) from a daemon whose only sink was syslog on a box with no syslogd.
+
+**Startup output is always visible**, even when daemonizing: netmand holds on to stdout/stderr until initialization has finished, so a failure to write the PID file or drop capabilities is reported on the terminal that launched it. Only afterwards does it detach them.
+
+Once running, a daemonized netmand goes quiet until the config parser wires up the syslog and file sinks. Two ways to watch it before then:
+
+- `-f` — stay in the foreground; logs go to your terminal
+- `-s` — daemonize, but keep stdout/stderr after startup instead of sending them to `/dev/null`, so output keeps flowing to whatever launched netmand. On a board that is the debug UART, by way of init. stdin still goes to `/dev/null`, and the daemon still detaches into its own session with no controlling terminal
+
+Log level and active sinks are configurable at runtime, via `[daemon]` in the config file and re-read on `SIGHUP`. Ring depth and maximum message length are compile-time (`LOG_RING_SIZE` × `LOG_MSG_MAX`, 64 × 128 B by default) — this is an embedded target, and scrollback that costs tens of KiB of RAM is not worth it.
+
+Emit macros are lowercase — `log_debug()`, `log_info()`, `log_warn()`, `log_error()` — so they cannot collide with the `LOG_DEBUG`/`LOG_INFO`/`LOG_WARNING`/`LOG_ERR` constants in `<syslog.h>`.
 
 ---
 
@@ -370,8 +381,22 @@ esac
 ```
 
 `netmand` daemonizes by default and writes `/var/run/netmand.pid`; pass `-f` to
-stay in the foreground. A second instance refuses to start and leaves the
-running daemon's PID file untouched.
+stay in the foreground, or `-s` to daemonize while keeping stdout/stderr on the
+console — on a board, `start) /usr/sbin/netmand -s -c ... &` puts the daemon's
+log on the debug UART.
+
+**The exit status is meaningful.** When daemonizing, the parent does not exit at
+the fork: it waits for the child to report whether startup succeeded and exits
+with that status. `netmand -c ...` returning 0 means the daemon is up, past its
+PID file and capability drop, and in its event loop — so an init script can
+actually test it:
+
+```sh
+start) /usr/sbin/netmand -c /etc/netmand/netmand.conf || echo "netmand failed to start" ;;
+```
+
+A second instance refuses to start, exits non-zero, and leaves the running
+daemon's PID file untouched.
 
 ---
 

@@ -34,14 +34,20 @@ CONFDIR   = conf
 TOOLDIR   = tools
 TESTDIR   = tests
 
-# --- Source files (Step 1: core only) ----------------------------------------
-CORE_SRCS = $(SRCDIR)/core/main.c \
-            $(SRCDIR)/core/priv.c
+# --- Source files (Steps 1, 1.5, 2) ------------------------------------------
+CORE_SRCS   = $(SRCDIR)/core/main.c \
+              $(SRCDIR)/core/priv.c
+
+LOGGER_SRCS = $(SRCDIR)/logger/logger.c
 
 # Collect all source files — add more as modules are implemented.
-SRCS      = $(CORE_SRCS)
+SRCS      = $(CORE_SRCS) $(LOGGER_SRCS)
 OBJS      = $(patsubst $(SRCDIR)/%.c, $(OBJDIR)/%.o, $(SRCS))
 DEPS      = $(OBJS:.o=.d)
+
+# Everything the daemon is made of except its entry point; the test binaries
+# link against this so they can exercise real modules, not stubs.
+LIB_OBJS  = $(filter-out $(OBJDIR)/core/main.o, $(OBJS))
 
 # --- Outputs -----------------------------------------------------------------
 DAEMON    = $(BUILDDIR)/netmand
@@ -76,11 +82,28 @@ $(OBJDIR):
 	@mkdir -p $@
 
 # =============================================================================
-# Tests (stub — will be fleshed out in Step 2+)
+# Tests — one self-contained binary per tests/test_*.c, each linked against
+# LIB_OBJS.  No test framework: a failing case exits non-zero, which is all
+# `make check` needs to fail the build.
 # =============================================================================
+TEST_SRCS = $(wildcard $(TESTDIR)/test_*.c)
+TEST_BINS = $(patsubst $(TESTDIR)/%.c, $(BUILDDIR)/tests/%, $(TEST_SRCS))
+TEST_DEPS = $(TEST_BINS:=.d)
+
+$(BUILDDIR)/tests/%: $(TESTDIR)/%.c $(LIB_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(LDFLAGS) -MMD -MP -MF $@.d -I$(SRCDIR) -o $@ $< \
+	    $(LIB_OBJS) $(LDLIBS)
+
 .PHONY: tests
-tests:
-	@echo "==> No tests defined yet (coming in Step 2: Logger)"
+tests: $(TEST_BINS)
+	@rc=0; \
+	for t in $(TEST_BINS); do \
+	    echo "==> $$t"; \
+	    $$t || rc=1; \
+	done; \
+	if [ $$rc -eq 0 ]; then echo "==> tests: OK"; else echo "==> tests: FAILED"; fi; \
+	exit $$rc
 
 # =============================================================================
 # CI — build under every toolchain we ship on.  Cross-compile breakage found
@@ -135,7 +158,7 @@ clean:
 # =============================================================================
 # Include auto-generated dependency files
 # =============================================================================
--include $(DEPS)
+-include $(DEPS) $(TEST_DEPS)
 
 # =============================================================================
 # Convenience: print variables for debugging the build system

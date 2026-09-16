@@ -40,6 +40,8 @@ typedef struct netmand_ctx {
     /* Configuration */
     const char *conf_path;       /* path to INI config file            */
     bool        foreground;      /* -f flag: stay in foreground         */
+    bool        keep_stdio;      /* -s flag: keep stdout/stderr after
+                                    startup instead of /dev/null        */
 
     /* Event loop */
     int         epoll_fd;        /* epoll file descriptor               */
@@ -48,6 +50,11 @@ typedef struct netmand_ctx {
 
     /* Signal handling */
     int         signal_fd;       /* signalfd for SIGTERM/SIGINT/SIGHUP  */
+
+    /* Daemonize readiness handshake.  Write end of the pipe the forked
+     * child uses to tell the parent whether startup succeeded; -1 in the
+     * foreground, and again once the verdict has been sent. */
+    int         ready_fd;
 
     /* PID file */
     const char *pid_path;        /* PID file path                       */

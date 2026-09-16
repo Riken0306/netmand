@@ -12,10 +12,11 @@
 
 #include "priv.h"
 
+#include "logger/logger.h"
+
 #include <errno.h>
 #include <linux/capability.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -45,7 +46,7 @@ int privileges_drop(void)
 
     memset(data, 0, sizeof(data));
     if (syscall(SYS_capget, &hdr, data) < 0) {
-        fprintf(stderr, "netmand: capget: %s\n", strerror(errno));
+        log_error("capget: %s", strerror(errno));
         return -1;
     }
     keep = data[0].permitted & KEEP_MASK;
@@ -62,8 +63,7 @@ int privileges_drop(void)
             /* EPERM here just means we never had CAP_SETPCAP (e.g. running
              * as an ordinary user); the capset below still applies. */
             if (errno != EPERM) {
-                fprintf(stderr, "netmand: PR_CAPBSET_DROP %d: %s\n",
-                        cap, strerror(errno));
+                log_error("PR_CAPBSET_DROP %d: %s", cap, strerror(errno));
                 return -1;
             }
             break;
@@ -76,22 +76,20 @@ int privileges_drop(void)
     data[0].effective = keep;
     data[0].permitted = keep;
     if (syscall(SYS_capset, &hdr, data) < 0) {
-        fprintf(stderr, "netmand: capset: %s\n", strerror(errno));
+        log_error("capset: %s", strerror(errno));
         return -1;
     }
 
     /* No exec can ever raise privileges from here. */
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
-        fprintf(stderr, "netmand: PR_SET_NO_NEW_PRIVS: %s\n", strerror(errno));
+        log_error("PR_SET_NO_NEW_PRIVS: %s", strerror(errno));
         return -1;
     }
 
     if (keep == KEEP_MASK)
-        fprintf(stderr, "netmand: capabilities reduced to "
-                "cap_net_admin,cap_net_raw\n");
+        log_info("capabilities reduced to cap_net_admin,cap_net_raw");
     else
-        fprintf(stderr, "netmand: not started privileged; capabilities "
-                "dropped to 0x%08x (network changes will fail)\n",
-                (unsigned)keep);
+        log_warn("not started privileged; capabilities dropped to 0x%08x "
+                 "(network changes will fail)", (unsigned)keep);
     return 0;
 }
